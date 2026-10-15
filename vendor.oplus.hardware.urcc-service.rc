@@ -1,0 +1,5 @@
+service vendor.oplus.hardware.urcc-service /vendor/odm/bin/hw/vendor.oplus.hardware.urcc-service
+    class hal
+    user system
+    group system readproc
+    interface aidl vendor.oplus.hardware.urcc.IUrcc/default
