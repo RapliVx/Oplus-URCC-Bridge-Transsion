@@ -14,6 +14,16 @@ use crate::vendor::oplus::hardware::urcc::IUrccCallback::IUrccCallback;
 
 type BinderResult<T> = rsbinder::status::Result<T>;
 
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
+}
+
+#[cfg(not(target_os = "android"))]
+unsafe fn __system_property_get(_name: *const libc::c_char, _value: *mut libc::c_char) -> libc::c_int {
+    0
+}
+
 fn init_logging() {
     let _ = tracing_log::LogTracer::init();
 
@@ -59,14 +69,14 @@ fn is_debug_logging_enabled() -> bool {
     let mut val = [0u8; 92];
     let key1 = b"persist.sys.urcc.debug\0";
     let len1 = unsafe {
-        libc::__system_property_get(key1.as_ptr() as *const libc::c_char, val.as_mut_ptr() as *mut libc::c_char)
+        __system_property_get(key1.as_ptr() as *const libc::c_char, val.as_mut_ptr() as *mut libc::c_char)
     };
     if len1 > 0 && val[0] == b'1' {
         return true;
     }
     let key2 = b"debug.urcc\0";
     let len2 = unsafe {
-        libc::__system_property_get(key2.as_ptr() as *const libc::c_char, val.as_mut_ptr() as *mut libc::c_char)
+        __system_property_get(key2.as_ptr() as *const libc::c_char, val.as_mut_ptr() as *mut libc::c_char)
     };
     len2 > 0 && val[0] == b'1'
 }
@@ -74,7 +84,7 @@ fn is_debug_logging_enabled() -> bool {
 fn get_system_prop(key: &[u8], default: &str) -> String {
     let mut val = [0u8; 92];
     let len = unsafe {
-        libc::__system_property_get(key.as_ptr() as *const libc::c_char, val.as_mut_ptr() as *mut libc::c_char)
+        __system_property_get(key.as_ptr() as *const libc::c_char, val.as_mut_ptr() as *mut libc::c_char)
     };
     if len > 0 {
         String::from_utf8_lossy(&val[..len as usize]).into_owned()
@@ -115,27 +125,36 @@ impl IUrcc for UrccService {
             tracing::debug!("TRANSACTION_urccResStateRequest -> reporting GPU load: {}%", load_str);
         }
 
-        let mut results;
-        if !request.mUrccRequestData.is_empty() {
-            results = Vec::with_capacity(request.mUrccRequestData.len());
-            for item in &request.mUrccRequestData {
-                results.push(UrccRequestData {
-                    res_Id: item.res_Id,
-                    event_Id: 0,
-                    res_Path: load_str.to_string(),
-                    res_Value: load_str.to_string(),
-                    desc: "gpu_loading".to_string(),
-                });
+        let mut results = Vec::new();
+        let mut has_requested = false;
+
+        if let Some(ref list) = request.mUrccRequestData {
+            if !list.is_empty() {
+                has_requested = true;
+                results.reserve(list.len());
+                for item_opt in list {
+                    if let Some(item) = item_opt {
+                        results.push(UrccRequestData {
+                            res_Id: item.res_Id,
+                            event_Id: 0,
+                            res_Path: Some(load_str.to_string()),
+                            res_Value: Some(load_str.to_string()),
+                            desc: Some("gpu_loading".to_string()),
+                        });
+                    }
+                }
             }
-        } else {
-            results = Vec::with_capacity(DEFAULT_OPCODES.len());
+        }
+
+        if !has_requested {
+            results.reserve(DEFAULT_OPCODES.len());
             for &opcode in &DEFAULT_OPCODES {
                 results.push(UrccRequestData {
                     res_Id: opcode,
                     event_Id: 0,
-                    res_Path: load_str.to_string(),
-                    res_Value: load_str.to_string(),
-                    desc: "gpu_loading".to_string(),
+                    res_Path: Some(load_str.to_string()),
+                    res_Value: Some(load_str.to_string()),
+                    desc: Some("gpu_loading".to_string()),
                 });
             }
         }
