@@ -4,7 +4,7 @@ package vendor.oplus.hardware.urcc;
 parcelable UrccRequestData {
     int res_Id;
     int event_Id;
-    String res_Path;
-    String res_Value;
-    String desc;
+    @nullable String res_Path;
+    @nullable String res_Value;
+    @nullable String desc;
 }
