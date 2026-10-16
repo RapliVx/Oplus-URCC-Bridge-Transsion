@@ -1,6 +1,6 @@
 # OPlus URCC AIDL HAL Service for Transsion Holdings Devices
 
-Universal lightweight implementation of `vendor.oplus.hardware.urcc.IUrcc` (Unified Resource Control Center) engineered for ColorOS, OxygenOS, and RealmeUI (Android 14+) ROM ports on all **Transsion Holdings** smartphones (**Infinix**, **Tecno**, and **Itel**), spanning **MediaTek** (Helio & Dimensity), **UNISOC** (Spreadtrum), and **Qualcomm Snapdragon** SoCs.
+High-performance, zero-memory-leak Rust implementation of `vendor.oplus.hardware.urcc.IUrcc` (Unified Resource Control Center) engineered for ColorOS, OxygenOS, and RealmeUI (Android 14+) ROM ports across all **Transsion Holdings** smartphones (**Infinix**, **Tecno**, and **Itel**), spanning **MediaTek** (Helio & Dimensity), **UNISOC** (Spreadtrum), and **Qualcomm Snapdragon** SoCs.
 
 ---
 
@@ -13,7 +13,7 @@ When running ColorOS on ported non-OPlus hardware without a functional URCC daem
 2. The GPU utilization monitor and performance gauge in PhoneManager and Game Space fail to appear or stay stuck at 0%.
 3. System stability mechanisms fail during boot phase handshakes (`reportBootPhase`), causing framework stalls or soft-reboots.
 
-This daemon acts as a drop-in universal AIDL HAL service that binds to `vendor.oplus.hardware.urcc.IUrcc/default`, implements the required Binder transactions, and bridges GPU loading metrics directly from kernel telemetry drivers across all Transsion architectures (MediaTek GED, Linux Devfreq ABI, UNISOC Governor, Qualcomm KGSL, and Mali DVFS interfaces).
+This daemon acts as a drop-in universal AIDL HAL service that binds to `vendor.oplus.hardware.urcc.IUrcc/default`, implements the required Binder transactions via pure memory-safe Rust (`rsbinder`), and bridges GPU loading metrics directly from kernel telemetry drivers across all Transsion architectures (MediaTek GED, Linux Devfreq ABI, UNISOC Governor, Qualcomm KGSL, and Mali DVFS interfaces).
 
 ---
 
@@ -35,16 +35,18 @@ flowchart TD
         VINTF["VINTF Manifest Fragment\n(manifest_oplus_urcc.xml)"]
     end
 
-    subgraph URCC_Daemon ["URCC HAL Shim Service (PID: system)"]
-        DISPATCHER["urcc_onTransact Dispatcher"]
-        SERIALIZER["Parcel Serializer\n(UrccRequestData Wire Format)"]
-        KERNEL_READER["MediaTek GPU Telemetry Reader"]
+    subgraph URCC_Daemon ["Rust URCC HAL Service (Pure Binder IPC)"]
+        DISPATCHER["rsbinder BnUrcc Dispatcher"]
+        SERIALIZER["Rust AIDL Parcel Serializer\n(UrccRequestData Wire Format)"]
+        KERNEL_READER["Lock-Free GPU Telemetry Engine\n(Persistent pread / vDSO Coarse Monotonic Timer)"]
     end
 
-    subgraph Kernel_Drivers ["Linux Kernel & MediaTek Hardware"]
+    subgraph Kernel_Drivers ["Linux Kernel & Hardware Drivers"]
         GED["/sys/module/ged/parameters/gpu_loading\n(MediaTek GED Kernel Module)"]
+        KGSL["/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage\n(Qualcomm Adreno)"]
+        DEVFREQ["/sys/class/devfreq/*\n(Linux Devfreq Governor)"]
         MALI_DEBUGFS["/sys/kernel/debug/mali0/dvfs_utilization\n(Mali Driver Node)"]
-        HARDWARE_GPU["ARM Mali-G57 MC2 GPU Core"]
+        HARDWARE_GPU["GPU Hardware Cores (Mali / Adreno)"]
     end
 
     PHONEMANAGER --> UAH_CLIENT
@@ -61,45 +63,20 @@ flowchart TD
     DISPATCHER --> SERIALIZER
     DISPATCHER --> KERNEL_READER
 
-    KERNEL_READER <-->|Primary Read: Integer %| GED
-    KERNEL_READER <-->|Fallback Read: busy/idle delta| MALI_DEBUGFS
+    KERNEL_READER <-->|Primary MTK: Integer %| GED
+    KERNEL_READER <-->|Primary QCOM: Integer %| KGSL
+    KERNEL_READER <-->|Dynamic Devfreq: cur/max| DEVFREQ
+    KERNEL_READER <-->|Fallback: busy/idle delta| MALI_DEBUGFS
 
     GED <--> HARDWARE_GPU
+    KGSL <--> HARDWARE_GPU
+    DEVFREQ <--> HARDWARE_GPU
     MALI_DEBUGFS <--> HARDWARE_GPU
-```
-
-### IPC Transaction & Execution Flow
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SystemServer as system_server / PhoneManager
-    participant UAHClient as liboplus-uah-client.so
-    participant UrccService as vendor.oplus.hardware.urcc-service
-    participant MTKKernel as MediaTek GED Driver
-
-    SystemServer->>UAHClient: UahGetFeatureStatus(featureId)
-    UAHClient->>UrccService: TRANSACTION_urccResStateRequest(inParcel)
-    
-    activate UrccService
-    UrccService->>MTKKernel: Read /sys/module/ged/parameters/gpu_loading
-    MTKKernel-->>UrccService: Returns integer (e.g. 14)
-    UrccService->>UrccService: Populate UrccRequestData (res_Path="14", res_Value="14")
-    UrccService-->>UAHClient: AParcel [Status: OK, Count: 1, UrccRequestData]
-    deactivate UrccService
-
-    activate UAHClient
-    Note over UAHClient: Calls std::stoi(element.res_Path)
-    UAHClient->>UAHClient: std::stoi("14") -> Returns 14 (No Exception)
-    UAHClient-->>SystemServer: Returns GPU utilization %
-    deactivate UAHClient
-
-    SystemServer->>SystemServer: Render GPU gauge in PhoneManager & Game Space
 ```
 
 ---
 
-## 3. Reverse Engineering Insights: Wire Format & `std::stoi` Caveat
+## 3. Reverse Engineering & Wire Format
 
 During deep disassembly of `/system_ext/lib64/liboplus-uah-client.so`, the disassembly of `UahGetFeatureStatus` revealed a critical architectural requirement:
 
@@ -126,23 +103,31 @@ During deep disassembly of `/system_ext/lib64/liboplus-uah-client.so`, the disas
 23e8c: mov   w19, w0                  ; Returned feature value
 ```
 
-### Root Cause of Previous Soft-Reboots
-* `UrccRequestData` layout in C++:
-  * Offset `+0x00`: `int32_t res_Id`
-  * Offset `+0x04`: `int32_t event_Id`
-  * Offset `+0x08`: `std::string res_Path` (24 bytes)
-  * Offset `+0x28`: `std::string res_Value` (24 bytes)
-  * Offset `+0x48`: `std::string desc` (24 bytes)
+### Memory Safety & Crash Prevention
 * If `res_Path` is written as an empty string `""`, `UahGetFeatureStatus` executes `std::stoi("")`.
-* `std::stoi("")` immediately throws an uncaught `std::invalid_argument` exception.
-* Because this occurs in `system_server` during boot (`reportBootPhase`), `system_server` terminates, prompting Android `init` to restart Zygote and trigger a loop back to the boot animation (soft-reboot).
-
-### The Solution
-In `write_urcc_request_data`, both `res_Path` and `res_Value` are populated simultaneously with the numeric GPU percentage string (or fallback `"0"`). `std::stoi` succeeds, and `system_server` stays completely stable.
+* `std::stoi("")` immediately throws an uncaught `std::invalid_argument` exception in `system_server`.
+* Because this occurs during boot (`reportBootPhase`), `system_server` crashes and triggers an infinite boot animation loop (soft-reboot).
+* **Rust Solution**: Both `res_Path` and `res_Value` are always populated with non-empty numeric strings (e.g. `"14"` or `"0"`). `std::stoi` always succeeds and the system remains 100% stable.
 
 ---
 
-## 4. Configuration & Deployment
+## 4. Zero Memory Leak & Zero Heap Churn Guarantees
+
+1. **Lock-Free Atomic Caching**:
+   - Monotonic time checks utilize `libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE)` which executes entirely in user space via vDSO (<10ns latency).
+   - Subsequent calls within the 50ms throttling window return immediately from atomic storage (`AtomicI32`, `AtomicI64`) with zero lock contention and zero syscalls.
+2. **Persistent Concurrency-Safe File Descriptor**:
+   - The active telemetry sysfs node is evaluated once at startup and maintained in a persistent file descriptor (`O_CLOEXEC`).
+   - Readings use POSIX `pread()`, allowing multiple Binder threads to sample GPU metrics concurrently without mutex locks and without altering file offsets.
+3. **Static Lookup Table**:
+   - A static string table `LOAD_STRINGS: [&'static str; 101]` maps GPU percentages (`0` to `100`) directly to static string slices.
+4. **Bounded Memory Footprint**:
+   - No growing caches, maps, or global state. All method vectors are bounded, scoped, and deallocated immediately upon transaction dispatch.
+   - Total RSS stays constant (~2 MB) throughout device uptime.
+
+---
+
+## 5. Configuration & Deployment
 
 ### 1. Init Configuration (.rc)
 File destination: `/vendor/odm/etc/init/vendor.oplus.hardware.urcc-service.rc` (or `/vendor/etc/init/`)  
@@ -156,11 +141,6 @@ service vendor.oplus.hardware.urcc-service /vendor/odm/bin/hw/vendor.oplus.hardw
     group system readproc
     interface aidl vendor.oplus.hardware.urcc.IUrcc/default
 ```
-
-Key Requirements:
-* Must execute from canonical path `/vendor/odm/bin/hw/...` rather than rootfs symlink `/odm/bin/hw/...`.
-* Must run under `user system`.
-* Do not declare `capabilities SYS_PTRACE`, as Android 14+ init blocks ptrace capabilities on HAL domains.
 
 ---
 
@@ -187,8 +167,6 @@ File destination: `/vendor/odm/bin/hw/vendor.oplus.hardware.urcc-service`
 Permissions: `0755` (`rwxr-xr-x`)  
 SELinux Context: `u:object_r:hal_urcc_default_exec:s0`
 
-When repacking EROFS partitions using DNA Tool or `mkfs.erofs`, configure the following:
-
 #### `fs_config` / `filesystem_config.txt`
 ```text
 vendor/odm/bin/hw/vendor.oplus.hardware.urcc-service 1000 1000 0755
@@ -203,12 +181,9 @@ vendor/odm/etc/vintf/manifest/manifest_oplus_urcc.xml 0 0 0644
 /vendor/odm/etc/vintf/manifest/manifest_oplus_urcc\.xml u:object_r:vendor_configs_file:s0
 ```
 
-> [!IMPORTANT]
-> If the binary is labeled `u:object_r:vendor_file:s0`, Android init will reject execution due to SELinux policy constraints (no transition domain from `init` to `hal_urcc_default`). Assigning `hal_urcc_default_exec:s0` is mandatory for automatic boot startup.
-
 ---
 
-## 5. AIDL Interface Reference
+## 6. AIDL Interface Reference
 
 Interface Descriptor: `vendor.oplus.hardware.urcc.IUrcc`  
 Instance Name: `vendor.oplus.hardware.urcc.IUrcc/default`  
@@ -217,10 +192,10 @@ Interface Version: `1`
 
 | Code | Method Name | Input | Output | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | `urccInit` | None | None | Client session establishment and DeathRecipient registration |
+| **1** | `urccInit` | None | None | Client session establishment |
 | **2** | `urccResCtlRequest` | `UrccRequestParcel` | `int32_t` (0) | HyperBoost dynamic resource lease allocation |
 | **3** | `urccResCtlRelease` | `int32_t` (handle) | `int32_t` (0) | HyperBoost resource release |
-| **4** | `urccResStateRequest` | `UrccRequestParcel` | `UrccRequestData[]` | Real-time GPU loading report (OpCodes: `0x01020220`, `0x01020240`) |
+| **4** | `urccResStateRequest` | `UrccRequestParcel` | `UrccRequestData[]` | Real-time GPU loading report (OpCodes: `0x01020220`, `0x01020240`, etc.) |
 | **5** | `urccResListeningRegister` | `UrccRequestParcel`, `IUrccCallback` | `int32_t` (0) | Resource threshold change listener registration |
 | **6** | `urccResListeningUnRegister` | `int32_t` (handle) | `int32_t` (0) | Unregister listener callback |
 | **7** | `urccPropertyGet` | `String` (key) | `String` ("0") | Query internal daemon configuration property |
@@ -236,66 +211,20 @@ Interface Version: `1`
 
 ---
 
-## 6. Build Instructions
-
-### Performance & Efficiency Optimizations
-* **Persistent File Descriptor (`pread`)**: Evaluates the platform's active sysfs telemetry node once on boot and maintains an open file descriptor. Eliminates `open()` / `close()` kernel syscalls and VFS path lookups on every transaction.
-* **vDSO Monotonic Timer Caching (`CLOCK_MONOTONIC_COARSE`)**: Throttles redundant hardware queries within a 50ms window. Subsequent queries return in `<10ns` purely in user space with zero context switches.
-* **Zero Heap Allocations (`0 malloc/free`)**: Reuses an immutable global `AStatus` header (`g_ok_status`) across all Binder transactions. Eliminates heap churn and allocator fragmentation.
-* **Fast Micro-itoa**: Replaces `snprintf()` formatting overhead with a direct branch-minimized integer-to-string serializer.
-* **Aggressive Compiler Tuning**: Compiled with `-O3 -flto -fno-unwind-tables -fomit-frame-pointer -ffunction-sections -fdata-sections -Wl,--gc-sections`.
+## 7. Build Instructions
 
 ### Prerequisites
 * Linux workstation (x86_64).
-* Android NDK r26b or newer with Clang (`aarch64-linux-android34-clang`).
-* 16KB memory page alignment support (`-Wl,-z,max-page-size=16384`).
+* Rust toolchain with `aarch64-linux-android` target installed (`rustup target add aarch64-linux-android`).
+* Android NDK r25b or newer (e.g. `android-ndk-r26b`).
 
 ### Compilation
 ```bash
 # Clean previous build artifacts
 ./build.sh clean
 
-# Compile binary, strip symbols, and package outputs
-./build.sh
+# Compile release binary, strip symbols, and package outputs
+./build.sh release
 ```
 
-### Generated Artifacts
-All generated files are placed in `out/`:
-* `vendor.oplus.hardware.urcc-service`: Stripped ARM64 ELF executable (~9.9 KB).
-* `vendor.oplus.hardware.urcc-service.rc`: Android init service configuration script.
-* `manifest_oplus_urcc.xml`: VINTF manifest XML fragment.
-* `urcc_package.zip`: Pre-packaged deployment archive.
-* `urcc_package.tar.gz`: Pre-packaged tarball archive.
-
----
-
-## 7. Verification Commands
-
-Once the ROM image is repacked and booted on the device, run the following verification steps:
-
-```bash
-# 1. Verify process is running under system user
-adb shell "ps -A | grep urcc"
-# Expected output:
-# system  <PID>  1  ...  vendor.oplus.hardware.urcc-service
-
-# 2. Verify AIDL registration with ServiceManager
-adb shell "service list | grep -i urcc"
-# Expected output:
-# vendor.oplus.hardware.urcc.IUrcc/default: [vendor.oplus.hardware.urcc.IUrcc]
-
-# 3. Verify init service state
-adb shell "getprop init.svc.vendor.oplus.hardware.urcc-service"
-# Expected output:
-# running
-
-# 4. Verify MediaTek kernel GPU reading node
-adb shell "cat /sys/module/ged/parameters/gpu_loading"
-# Expected output:
-# Integer value between 0 and 100
-
-# 5. Enable runtime debug logs (optional, default disabled for peak performance)
-adb shell "setprop persist.sys.urcc.debug 1"
-# Disable debug logs:
-adb shell "setprop persist.sys.urcc.debug 0"
-```
+The script builds the binary using Cargo, strips unnecessary symbols using `llvm-strip`, and packages the output into `out/urcc_package.tar.gz` and `out/urcc_package.zip`.

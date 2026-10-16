@@ -1,0 +1,6 @@
+/target
+/out
+*.tar.gz
+*.zip
+*.so
+.DS_Store
